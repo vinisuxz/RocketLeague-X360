@@ -1,4 +1,3 @@
-
 name: Build RocketLeague X360
 
 on:
@@ -62,26 +61,26 @@ jobs:
       - name: Checkout glslang-xenon
         uses: actions/checkout@v4
         with:
-            repository: xenosworks/glslang-xenon
-            ref: xenon
-            path: glslang-xenon
+          repository: xenosworks/glslang-xenon
+          ref: xenon
+          path: glslang-xenon
 
-       - name: Build glslang
-         run: |
-            cd glslang-xenon
-            python3 update_glslang_sources.py
-            cmake -S . -B build -G Ninja \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DENABLE_OPT=ON \
-              -DSPIRV_SKIP_EXECUTABLES=ON \
-              -DGLSLANG_TESTS=OFF
-            cmake --build build
+      - name: Build glslang
+        run: |
+          cd glslang-xenon
+          python3 update_glslang_sources.py
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_OPT=ON \
+            -DSPIRV_SKIP_EXECUTABLES=ON \
+            -DGLSLANG_TESTS=OFF
+          cmake --build build
 
-        - name: Install glslang
-          run: |
-            cp glslang-xenon/build/StandAlone/glslang \
-              xsdk-gcc/bin/glslang
-            xsdk-gcc/bin/glslang --version
+      - name: Install glslang
+        run: |
+          cp glslang-xenon/build/StandAlone/glslang \
+            xsdk-gcc/bin/glslang
+          xsdk-gcc/bin/glslang --version
 
       - name: Build XSDK library
         run: |
@@ -104,4 +103,3 @@ jobs:
         with:
           name: RocketLeague-X360
           path: build/RocketLeague.xex
-          
