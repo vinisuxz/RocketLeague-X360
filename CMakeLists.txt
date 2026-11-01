@@ -18,3 +18,8 @@ target_compile_options(RocketLeague PRIVATE
 )
 
 xsdk_add_xex(RocketLeague)
+
+xsdk_add_shaders(RocketLeague
+    src/cube.vert
+    src/cube.frag
+)
