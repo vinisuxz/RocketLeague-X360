@@ -1,3 +1,4 @@
+
 name: Build RocketLeague X360
 
 on:
@@ -30,21 +31,22 @@ jobs:
           path: xsdk
 
       - name: Download Champions Field
-       run: |
-            mkdir -p assets/arena
-            curl -L "https://github.com/vinisuxz/RocketLeague-X360/releases/download/v1.0/champions_field_-_rocket_league_stadium.glb" \
-              -o assets/arena/champions_field.glb
-              
+        run: |
+          mkdir -p assets/arena
+          curl -fL "https://github.com/vinisuxz/RocketLeague-X360/releases/download/v1.0/champions_field_-_rocket_league_stadium.glb" \
+            -o assets/arena/champions_field.glb
+          test -s assets/arena/champions_field.glb
+
       - name: Install converter dependencies
-       run: |
+        run: |
           python3 -m pip install --break-system-packages numpy trimesh
 
       - name: Convert Champions Field
-       run: |
-            python3 tools/convert_glb.py \
-              assets/arena/champions_field.glb \
-              --out build/arena/champions_field.rlar
-              
+        run: |
+          python3 tools/convert_glb.py \
+            assets/arena/champions_field.glb \
+            --out build/arena/champions_field.rlar
+
       - name: Build XSDK toolchain
         run: |
           PREFIX="$GITHUB_WORKSPACE/xsdk-gcc"
@@ -78,3 +80,4 @@ jobs:
         with:
           name: RocketLeague-X360
           path: build/RocketLeague.xex
+          
