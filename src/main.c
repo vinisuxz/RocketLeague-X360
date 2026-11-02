@@ -536,6 +536,8 @@ int main(void)
 
     status = xsdk_gpu_open();
 
+             check_stadium_file();
+
     if (!NT_SUCCESS(status)) {
         xsdk_log_write("RocketLeague: GPU open failed");
         return 1;
