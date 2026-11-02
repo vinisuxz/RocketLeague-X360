@@ -12,6 +12,7 @@
 #include "xsdk/shader.h"
 #include "xsdk/splash.h"
 #include "xsdk/texture.h"
+#include <stdlib.h>
 
 enum {
     SPLASH_MS = 2000,
@@ -426,6 +427,24 @@ static uint32_t read_u32_le(const uint8_t *p)
         | ((uint32_t)p[3] << 24);
 }
 
+static bool read_exact(HANDLE file, void *buffer, uint32_t size)
+{
+    IO_STATUS_BLOCK io = {0};
+
+    NTSTATUS status = NtReadFile(
+        file,
+        0,
+        NULL,
+        NULL,
+        &io,
+        buffer,
+        size,
+        NULL
+    );
+
+    return NT_SUCCESS(status) && io.information == size;
+}
+
 static void check_stadium_file(void)
 {
     const char path[] = "game:\\arena\\champions_field.rlar";
@@ -525,6 +544,185 @@ static void check_stadium_file(void)
     }
 }
 
+static void scan_stadium_file(void)
+{
+    const char path[] = "game:\\arena\\champions_field.rlar";
+
+    ANSI_STRING name = {
+        (uint16_t)(sizeof(path) - 1),
+        (uint16_t)(sizeof(path) - 1),
+        path
+    };
+
+    OBJECT_ATTRIBUTES attributes = {
+        OB_DOS_DEVICES,
+        &name,
+        0
+    };
+
+    HANDLE file = 0;
+    IO_STATUS_BLOCK io = {0};
+
+    NTSTATUS status = NtCreateFile(
+        &file,
+        GENERIC_READ | SYNCHRONIZE,
+        &attributes,
+        &io,
+        NULL,
+        FILE_ATTRIBUTE_NORMAL,
+        FILE_SHARE_READ,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE |
+        FILE_SYNCHRONOUS_IO_NONALERT
+    );
+
+    if (!NT_SUCCESS(status)) {
+        xsdk_log_write("SCAN: erro ao abrir estadio");
+        return;
+    }
+
+    uint8_t header[12];
+
+    if (!read_exact(file, header, 12)) {
+        xsdk_log_write("SCAN: erro no cabecalho");
+        NtClose(file);
+        return;
+    }
+
+    if (header[0] != 'R' || header[1] != 'L' ||
+        header[2] != 'A' || header[3] != 'R' ||
+        read_u32_le(&header[4]) != 2) {
+        xsdk_log_write("SCAN: formato invalido");
+        NtClose(file);
+        return;
+    }
+
+    uint32_t chunks = read_u32_le(&header[8]);
+
+    uint8_t *vertices = malloc(60000 * 32);
+
+    if (!vertices) {
+        xsdk_log_write("SCAN: memoria insuficiente");
+        NtClose(file);
+        return;
+    }
+
+    uint8_t skip_buffer[4096];
+
+    float min_x =  1.0e30f;
+    float min_y =  1.0e30f;
+    float min_z =  1.0e30f;
+
+    float max_x = -1.0e30f;
+    float max_y = -1.0e30f;
+    float max_z = -1.0e30f;
+
+    uint32_t total_vertices = 0;
+    uint32_t total_indices = 0;
+    bool valid = true;
+
+    for (uint32_t chunk = 0; chunk < chunks; chunk++) {
+        uint8_t chunk_header[8];
+
+        if (!read_exact(file, chunk_header, 8)) {
+            valid = false;
+            break;
+        }
+
+        uint32_t vertex_count = read_u32_le(chunk_header);
+        uint32_t index_count = read_u32_le(&chunk_header[4]);
+
+        if (vertex_count == 0 || vertex_count > 60000 ||
+            index_count == 0 || index_count % 3 != 0) {
+            valid = false;
+            break;
+        }
+
+        uint32_t vertex_bytes = vertex_count * 32;
+        uint32_t index_bytes = index_count * 2;
+
+        if (!read_exact(file, vertices, vertex_bytes)) {
+            valid = false;
+            break;
+        }
+
+        for (uint32_t i = 0; i < vertex_count; i++) {
+            uint8_t *v = &vertices[i * 32];
+
+            uint32_t bx = read_u32_le(&v[0]);
+            uint32_t by = read_u32_le(&v[4]);
+            uint32_t bz = read_u32_le(&v[8]);
+
+            float x, y, z;
+
+            memcpy(&x, &bx, 4);
+            memcpy(&y, &by, 4);
+            memcpy(&z, &bz, 4);
+
+            if (x < min_x) min_x = x;
+            if (y < min_y) min_y = y;
+            if (z < min_z) min_z = z;
+
+            if (x > max_x) max_x = x;
+            if (y > max_y) max_y = y;
+            if (z > max_z) max_z = z;
+        }
+
+        uint32_t remaining = index_bytes;
+
+        while (remaining > 0) {
+            uint32_t amount = remaining;
+
+            if (amount > sizeof(skip_buffer))
+                amount = sizeof(skip_buffer);
+
+            if (!read_exact(file, skip_buffer, amount)) {
+                valid = false;
+                break;
+            }
+
+            remaining -= amount;
+        }
+
+        if (!valid)
+            break;
+
+        total_vertices += vertex_count;
+        total_indices += index_count;
+    }
+
+    if (valid) {
+        xsdk_log_write("SCAN: blocos lidos: %u", chunks);
+        xsdk_log_write("SCAN: vertices: %u", total_vertices);
+        xsdk_log_write("SCAN: indices: %u", total_indices);
+
+        xsdk_log_write(
+            "SCAN: X %d ate %d",
+            (int)(min_x * 1000.0f),
+            (int)(max_x * 1000.0f)
+        );
+
+        xsdk_log_write(
+            "SCAN: Y %d ate %d",
+            (int)(min_y * 1000.0f),
+            (int)(max_y * 1000.0f)
+        );
+
+        xsdk_log_write(
+            "SCAN: Z %d ate %d",
+            (int)(min_z * 1000.0f),
+            (int)(max_z * 1000.0f)
+        );
+
+        xsdk_log_write("SCAN: leitura concluida!");
+    } else {
+        xsdk_log_write("SCAN: erro ao percorrer os blocos");
+    }
+
+    free(vertices);
+    NtClose(file);
+}
+
 int main(void)
 {
     xsdk_log_write("RocketLeague: START");
@@ -537,6 +735,7 @@ int main(void)
     status = xsdk_gpu_open();
 
              check_stadium_file();
+             scan_stadium_file();
 
     if (!NT_SUCCESS(status)) {
         xsdk_log_write("RocketLeague: GPU open failed");
