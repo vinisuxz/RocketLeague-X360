@@ -1,7 +1,7 @@
-
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "RocketLeague_shaders.h"
@@ -12,30 +12,39 @@
 #include "xsdk/shader.h"
 #include "xsdk/splash.h"
 #include "xsdk/texture.h"
-#include <stdlib.h>
 
 enum {
     SPLASH_MS = 2000,
     BUFFERS = 2,
     SWAP_INTERVAL = 1,
     BEGIN_TIMEOUT_MS = 5000,
-
     CLEAR_ARGB = 0xFF183060,
 
     VERTEX_COUNT = 24,
     INDEX_COUNT = 36,
     VERTEX_FLOATS = 8,
-
     VERTEX_STRIDE = VERTEX_FLOATS * 4,
     VERTEX_BYTES = VERTEX_COUNT * VERTEX_STRIDE,
     INDEX_BYTES = INDEX_COUNT * 2,
+    TEXTURE_SIZE = 2,
 
-    TEXTURE_SIZE = 2
+    MAX_STADIUM_CHUNKS = 3000,
+    MAX_STADIUM_VERTICES_PER_CHUNK = 60000,
+    MAX_DRAW_INDICES = 65532
 };
+
+#define STADIUM_PATH "game:\\arena\\champions_field.rlar"
 
 typedef struct {
     float m[16];
 } Matrix;
+
+typedef struct {
+    uint32_t vertex_offset;
+    uint32_t index_offset;
+    uint32_t vertex_count;
+    uint32_t index_count;
+} StadiumChunk;
 
 typedef struct {
     XsdkShader vertex;
@@ -46,6 +55,12 @@ typedef struct {
 
     volatile uint32_t *vertices;
     volatile uint32_t *indices;
+
+    volatile uint32_t *stadium_vertices;
+    volatile uint32_t *stadium_indices;
+
+    StadiumChunk *stadium_chunks;
+    uint32_t stadium_chunk_count;
 } Renderer;
 
 static const XsdkVertexElement vertex_layout[] = {
@@ -66,11 +81,383 @@ static const XsdkVertexElement vertex_layout[] = {
     }
 };
 
+static uint32_t read_u32_le(const uint8_t *p)
+{
+    return (uint32_t)p[0]
+        | ((uint32_t)p[1] << 8)
+        | ((uint32_t)p[2] << 16)
+        | ((uint32_t)p[3] << 24);
+}
+
+static uint16_t read_u16_le(const uint8_t *p)
+{
+    return (uint16_t)(
+        (uint16_t)p[0] |
+        ((uint16_t)p[1] << 8)
+    );
+}
+
+static bool read_exact(HANDLE file, void *buffer, uint32_t size)
+{
+    IO_STATUS_BLOCK io = {0};
+
+    NTSTATUS status = NtReadFile(
+        file,
+        0,
+        NULL,
+        NULL,
+        &io,
+        buffer,
+        size,
+        NULL
+    );
+
+    return NT_SUCCESS(status) && io.information == size;
+}
+
+static HANDLE open_stadium(void)
+{
+    const char path[] = STADIUM_PATH;
+
+    ANSI_STRING name = {
+        (uint16_t)(sizeof(path) - 1),
+        (uint16_t)(sizeof(path) - 1),
+        path
+    };
+
+    OBJECT_ATTRIBUTES attributes = {
+        OB_DOS_DEVICES,
+        &name,
+        0
+    };
+
+    HANDLE file = 0;
+    IO_STATUS_BLOCK io = {0};
+
+    NTSTATUS status = NtCreateFile(
+        &file,
+        GENERIC_READ | SYNCHRONIZE,
+        &attributes,
+        &io,
+        NULL,
+        FILE_ATTRIBUTE_NORMAL,
+        FILE_SHARE_READ,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE |
+        FILE_SYNCHRONOUS_IO_NONALERT
+    );
+
+    if (!NT_SUCCESS(status)) {
+        xsdk_log_write(
+            "ARENA: erro ao abrir arquivo: 0x%08X",
+            (uint32_t)status
+        );
+        return 0;
+    }
+
+    return file;
+}
+
+static bool skip_file_bytes(HANDLE file, uint32_t bytes)
+{
+    uint8_t buffer[4096];
+
+    while (bytes > 0) {
+        uint32_t amount = bytes;
+
+        if (amount > sizeof(buffer))
+            amount = sizeof(buffer);
+
+        if (!read_exact(file, buffer, amount))
+            return false;
+
+        bytes -= amount;
+    }
+
+    return true;
+}
+
+static void write_gpu_words(
+    volatile uint32_t *destination,
+    const uint8_t *source,
+    uint32_t word_count
+)
+{
+    for (uint32_t i = 0; i < word_count; i++) {
+        destination[i] = read_u32_le(source + i * 4);
+    }
+}
+
+static void write_stadium_indices(
+    volatile uint32_t *destination,
+    const uint8_t *source,
+    uint32_t index_count
+)
+{
+    uint32_t word_count = (index_count + 1) / 2;
+
+    for (uint32_t i = 0; i < word_count; i++) {
+        uint32_t index = i * 2;
+
+        uint32_t first = read_u16_le(
+            source + index * 2
+        );
+
+        uint32_t second = 0;
+
+        if (index + 1 < index_count) {
+            second = read_u16_le(
+                source + (index + 1) * 2
+            );
+        }
+
+        destination[i] = (first << 16) | second;
+    }
+}
+
+static bool load_stadium(Renderer *renderer)
+{
+    HANDLE file = open_stadium();
+
+    if (!file)
+        return false;
+
+    uint8_t header[12];
+
+    if (!read_exact(file, header, sizeof(header)) ||
+        header[0] != 'R' ||
+        header[1] != 'L' ||
+        header[2] != 'A' ||
+        header[3] != 'R' ||
+        read_u32_le(&header[4]) != 2) {
+
+        xsdk_log_write("ARENA: cabecalho RLAR invalido");
+        NtClose(file);
+        return false;
+    }
+
+    uint32_t chunk_count = read_u32_le(&header[8]);
+
+    if (chunk_count == 0 ||
+        chunk_count > MAX_STADIUM_CHUNKS) {
+
+        xsdk_log_write(
+            "ARENA: quantidade de blocos invalida: %u",
+            chunk_count
+        );
+
+        NtClose(file);
+        return false;
+    }
+
+    uint32_t total_vertices = 0;
+    uint32_t total_indices = 0;
+    bool valid = true;
+
+    /* Primeira leitura: validar e calcular a memoria necessária. */
+    for (uint32_t i = 0; i < chunk_count; i++) {
+        uint8_t chunk_header[8];
+
+        if (!read_exact(file, chunk_header, 8)) {
+            valid = false;
+            break;
+        }
+
+        uint32_t vertex_count = read_u32_le(chunk_header);
+        uint32_t index_count = read_u32_le(&chunk_header[4]);
+
+        if (vertex_count == 0 ||
+            vertex_count > MAX_STADIUM_VERTICES_PER_CHUNK ||
+            index_count == 0 ||
+            index_count % 3 != 0 ||
+            total_vertices > UINT32_MAX - vertex_count ||
+            total_indices > UINT32_MAX - index_count) {
+
+            valid = false;
+            break;
+        }
+
+        if (!skip_file_bytes(file, vertex_count * 32u) ||
+            !skip_file_bytes(file, index_count * 2u)) {
+
+            valid = false;
+            break;
+        }
+
+        total_vertices += vertex_count;
+        total_indices += index_count;
+    }
+
+    NtClose(file);
+
+    if (!valid || total_vertices == 0 || total_indices == 0) {
+        xsdk_log_write("ARENA: falha na validacao dos blocos");
+        return false;
+    }
+
+    uint32_t vertex_bytes = total_vertices * 32u;
+    uint32_t index_bytes = total_indices * 2u;
+    uint32_t index_allocation = (index_bytes + 3u) & ~3u;
+
+    if (vertex_bytes / 32u != total_vertices ||
+        index_bytes / 2u != total_indices) {
+
+        xsdk_log_write("ARENA: tamanho excede o limite");
+        return false;
+    }
+
+    renderer->stadium_vertices = xsdk_gpu_alloc(vertex_bytes);
+    renderer->stadium_indices = xsdk_gpu_alloc(index_allocation);
+    renderer->stadium_chunks = calloc(
+        chunk_count,
+        sizeof(StadiumChunk)
+    );
+
+    uint8_t *vertex_raw = malloc(
+        MAX_STADIUM_VERTICES_PER_CHUNK * 32u
+    );
+
+    uint8_t *index_raw = malloc(index_bytes);
+
+    if (!renderer->stadium_vertices ||
+        !renderer->stadium_indices ||
+        !renderer->stadium_chunks ||
+        !vertex_raw ||
+        !index_raw) {
+
+        xsdk_log_write("ARENA: memoria insuficiente");
+
+        free(vertex_raw);
+        free(index_raw);
+        return false;
+    }
+
+    file = open_stadium();
+
+    if (!file) {
+        free(vertex_raw);
+        free(index_raw);
+        return false;
+    }
+
+    if (!read_exact(file, header, sizeof(header)) ||
+        header[0] != 'R' ||
+        header[1] != 'L' ||
+        header[2] != 'A' ||
+        header[3] != 'R' ||
+        read_u32_le(&header[4]) != 2 ||
+        read_u32_le(&header[8]) != chunk_count) {
+
+        xsdk_log_write("ARENA: arquivo mudou durante carregamento");
+
+        NtClose(file);
+        free(vertex_raw);
+        free(index_raw);
+        return false;
+    }
+
+    uint32_t vertex_offset = 0;
+    uint32_t index_offset = 0;
+
+    for (uint32_t i = 0; i < chunk_count; i++) {
+        uint8_t chunk_header[8];
+
+        if (!read_exact(file, chunk_header, 8)) {
+            valid = false;
+            break;
+        }
+
+        uint32_t vertex_count = read_u32_le(chunk_header);
+        uint32_t index_count = read_u32_le(&chunk_header[4]);
+
+        if (vertex_count == 0 ||
+            vertex_count > MAX_STADIUM_VERTICES_PER_CHUNK ||
+            index_count == 0 ||
+            index_count % 3 != 0 ||
+            vertex_offset + vertex_count * 32u > vertex_bytes ||
+            index_offset + index_count * 2u > index_bytes) {
+
+            valid = false;
+            break;
+        }
+
+        uint32_t current_vertex_bytes = vertex_count * 32u;
+        uint32_t current_index_bytes = index_count * 2u;
+
+        if (!read_exact(file, vertex_raw, current_vertex_bytes) ||
+            !read_exact(
+                file,
+                index_raw + index_offset,
+                current_index_bytes
+            )) {
+
+            valid = false;
+            break;
+        }
+
+        renderer->stadium_chunks[i].vertex_offset = vertex_offset;
+        renderer->stadium_chunks[i].index_offset = index_offset;
+        renderer->stadium_chunks[i].vertex_count = vertex_count;
+        renderer->stadium_chunks[i].index_count = index_count;
+
+        write_gpu_words(
+            renderer->stadium_vertices + vertex_offset / 4u,
+            vertex_raw,
+            current_vertex_bytes / 4u
+        );
+
+        vertex_offset += current_vertex_bytes;
+        index_offset += current_index_bytes;
+    }
+
+    NtClose(file);
+
+    if (!valid ||
+        vertex_offset != vertex_bytes ||
+        index_offset != index_bytes) {
+
+        xsdk_log_write("ARENA: erro durante leitura dos dados");
+
+        free(vertex_raw);
+        free(index_raw);
+        return false;
+    }
+
+    write_stadium_indices(
+        renderer->stadium_indices,
+        index_raw,
+        total_indices
+    );
+
+    xsdk_gpu_invalidate(
+        xsdk_gpu_address(renderer->stadium_vertices),
+        vertex_bytes
+    );
+
+    xsdk_gpu_invalidate(
+        xsdk_gpu_address(renderer->stadium_indices),
+        index_allocation
+    );
+
+    renderer->stadium_chunk_count = chunk_count;
+
+    free(vertex_raw);
+    free(index_raw);
+
+    xsdk_log_write("ARENA: estadio carregado!");
+    xsdk_log_write("ARENA: blocos: %u", chunk_count);
+    xsdk_log_write("ARENA: vertices: %u", total_vertices);
+    xsdk_log_write("ARENA: indices: %u", total_indices);
+
+    return true;
+}
+
 static void write_gpu(
     volatile uint32_t *memory,
     const void *data,
     uint32_t size
-) {
+)
+{
     const uint8_t *source = data;
 
     for (uint32_t i = 0; i < size / 4; i++) {
@@ -88,37 +475,31 @@ static void write_gpu(
 static bool create_mesh(Renderer *renderer)
 {
     static const float vertices[VERTEX_COUNT][VERTEX_FLOATS] = {
-        /* Frente */
         {-0.5f,-0.5f, 0.5f, 1,0,0, 0,1},
         { 0.5f,-0.5f, 0.5f, 1,0,0, 1,1},
         {-0.5f, 0.5f, 0.5f, 1,0,0, 0,0},
         { 0.5f, 0.5f, 0.5f, 1,0,0, 1,0},
 
-        /* Trás */
         { 0.5f,-0.5f,-0.5f, 0,0,1, 0,1},
         {-0.5f,-0.5f,-0.5f, 0,0,1, 1,1},
         { 0.5f, 0.5f,-0.5f, 0,0,1, 0,0},
         {-0.5f, 0.5f,-0.5f, 0,0,1, 1,0},
 
-        /* Direita */
         { 0.5f,-0.5f, 0.5f, 0,1,0, 0,1},
         { 0.5f,-0.5f,-0.5f, 0,1,0, 1,1},
         { 0.5f, 0.5f, 0.5f, 0,1,0, 0,0},
         { 0.5f, 0.5f,-0.5f, 0,1,0, 1,0},
 
-        /* Esquerda */
         {-0.5f,-0.5f,-0.5f, 1,1,0, 0,1},
         {-0.5f,-0.5f, 0.5f, 1,1,0, 1,1},
         {-0.5f, 0.5f,-0.5f, 1,1,0, 0,0},
         {-0.5f, 0.5f, 0.5f, 1,1,0, 1,0},
 
-        /* Cima */
         {-0.5f, 0.5f, 0.5f, 1,0,1, 0,1},
         { 0.5f, 0.5f, 0.5f, 1,0,1, 1,1},
         {-0.5f, 0.5f,-0.5f, 1,0,1, 0,0},
         { 0.5f, 0.5f,-0.5f, 1,0,1, 1,0},
 
-        /* Baixo */
         {-0.5f,-0.5f,-0.5f, 0,1,1, 0,1},
         { 0.5f,-0.5f,-0.5f, 0,1,1, 1,1},
         {-0.5f,-0.5f, 0.5f, 0,1,1, 0,0},
@@ -165,8 +546,8 @@ static bool create_texture(Renderer *renderer)
     }
 
     static const uint32_t texels[TEXTURE_SIZE][TEXTURE_SIZE] = {
-        {0xFFFFFFFF, 0xFF808080},
-        {0xFF808080, 0xFFFFFFFF}
+        {0xFFFFFFFF, 0xFFFFFFFF},
+        {0xFFFFFFFF, 0xFFFFFFFF}
     };
 
     xsdk_texture_upload(
@@ -189,7 +570,10 @@ static bool create_texture(Renderer *renderer)
         .address_v = XSDK_ADDRESS_WRAP
     };
 
-    xsdk_texture_sampler_state(&renderer->sampler, &sampler);
+    xsdk_texture_sampler_state(
+        &renderer->sampler,
+        &sampler
+    );
 
     return true;
 }
@@ -233,12 +617,19 @@ static bool create_renderer(Renderer *renderer)
         .depth_compare = XSDK_COMPARE_LESS_EQUAL
     };
 
-    xsdk_gpu_depth_stencil_state(&renderer->depth, &depth);
+    xsdk_gpu_depth_stencil_state(
+        &renderer->depth,
+        &depth
+    );
 
-    return create_mesh(renderer) && create_texture(renderer);
+    return create_mesh(renderer) &&
+           create_texture(renderer);
 }
 
-static Matrix multiply_matrix(const Matrix *a, const Matrix *b)
+static Matrix multiply_matrix(
+    const Matrix *a,
+    const Matrix *b
+)
 {
     Matrix result;
 
@@ -262,7 +653,7 @@ static Matrix camera_matrix(float angle, float aspect)
 {
     const float fov = 1.0f;
     const float near_plane = 0.1f;
-    const float far_plane = 10.0f;
+    const float far_plane = 30.0f;
 
     const float f = 1.0f / tanf(fov / 2.0f);
     const float fx = f / aspect;
@@ -285,16 +676,102 @@ static Matrix camera_matrix(float angle, float aspect)
     const float c = cosf(angle);
     const float s = sinf(angle);
 
-    const Matrix rotation = {{
+    const Matrix rotation_y = {{
          c, 0, -s, 0,
          0, 1,  0, 0,
          s, 0,  c, 0,
          0, 0,  0, 1
     }};
 
-    const Matrix transformed = multiply_matrix(&camera, &rotation);
+    const float tilt = -0.42f;
+    const float ct = cosf(tilt);
+    const float st = sinf(tilt);
+
+    const Matrix rotation_x = {{
+        1,  0,  0, 0,
+        0, ct, st, 0,
+        0,-st, ct, 0,
+        0,  0,  0, 1
+    }};
+
+    /*
+     * Escala inicial para enquadrar o estádio.
+     * O deslocamento vertical centraliza aproximadamente
+     * os limites encontrados na leitura do arquivo.
+     */
+    const Matrix model = {{
+        0.035f, 0,       0,       0,
+        0,      0.035f,  0,       0,
+        0,      0,       0.035f,  0,
+        0,      0.14194f,0,       1
+    }};
+
+    Matrix transformed = multiply_matrix(&camera, &rotation_y);
+    transformed = multiply_matrix(&transformed, &rotation_x);
+    transformed = multiply_matrix(&transformed, &model);
 
     return multiply_matrix(&projection, &transformed);
+}
+
+static void draw_cube(const Renderer *renderer)
+{
+    xsdk_gpu_set_vertices(
+        0,
+        xsdk_gpu_address(renderer->vertices),
+        VERTEX_BYTES
+    );
+
+    xsdk_gpu_draw_indexed(
+        XSDK_PRIMITIVE_TRIANGLE_LIST,
+        xsdk_gpu_address(renderer->indices),
+        INDEX_COUNT,
+        false
+    );
+}
+
+static void draw_stadium(const Renderer *renderer)
+{
+    for (uint32_t i = 0; i < renderer->stadium_chunk_count; i++) {
+        const StadiumChunk *chunk = &renderer->stadium_chunks[i];
+
+        uint32_t vertex_address =
+            xsdk_gpu_address(renderer->stadium_vertices) +
+            chunk->vertex_offset;
+
+        xsdk_gpu_set_vertices(
+            0,
+            vertex_address,
+            chunk->vertex_count * 32u
+        );
+
+        uint32_t drawn = 0;
+
+        while (drawn < chunk->index_count) {
+            uint32_t amount = chunk->index_count - drawn;
+
+            if (amount > MAX_DRAW_INDICES)
+                amount = MAX_DRAW_INDICES;
+
+            amount -= amount % 3u;
+
+            if (amount == 0)
+                break;
+
+            uint32_t index_address =
+                xsdk_gpu_address(renderer->stadium_indices) +
+                chunk->index_offset +
+                drawn * 2u;
+
+            xsdk_gpu_draw_indexed(
+                XSDK_PRIMITIVE_TRIANGLE_LIST,
+                index_address,
+                amount,
+                false
+            );
+
+            drawn += amount;
+        }
+    }
 }
 
 static void draw_frame(
@@ -329,20 +806,17 @@ static void draw_frame(
         &renderer->sampler
     );
 
-    xsdk_gpu_set_vertices(
-        0,
-        xsdk_gpu_address(renderer->vertices),
-        VERTEX_BYTES
-    );
+    if (renderer->stadium_chunk_count > 0)
+        draw_stadium(renderer);
+    else
+        draw_cube(renderer);
 
-    xsdk_gpu_draw_indexed(
-        XSDK_PRIMITIVE_TRIANGLE_LIST,
-        xsdk_gpu_address(renderer->indices),
-        INDEX_COUNT,
-        false
+    xsdk_gpu_resolve(
+        address,
+        width,
+        height,
+        CLEAR_ARGB
     );
-
-    xsdk_gpu_resolve(address, width, height, CLEAR_ARGB);
 }
 
 static float read_stick(int16_t value)
@@ -370,7 +844,8 @@ static void game_loop(
             if (input.gamepad.buttons & INPUT_GAMEPAD_BACK)
                 break;
 
-            angle += 0.05f * read_stick(input.gamepad.thumb_lx);
+            angle += 0.025f *
+                read_stick(input.gamepad.thumb_lx);
         }
 
         uint32_t address;
@@ -409,6 +884,14 @@ static void destroy_renderer(Renderer *renderer)
 {
     xsdk_texture_free(&renderer->texture);
 
+    if (renderer->stadium_indices)
+        xsdk_gpu_free(renderer->stadium_indices);
+
+    if (renderer->stadium_vertices)
+        xsdk_gpu_free(renderer->stadium_vertices);
+
+    free(renderer->stadium_chunks);
+
     if (renderer->indices)
         xsdk_gpu_free(renderer->indices);
 
@@ -417,310 +900,8 @@ static void destroy_renderer(Renderer *renderer)
 
     xsdk_shader_free(&renderer->pixel);
     xsdk_shader_free(&renderer->vertex);
-}
 
-static uint32_t read_u32_le(const uint8_t *p)
-{
-    return (uint32_t)p[0]
-        | ((uint32_t)p[1] << 8)
-        | ((uint32_t)p[2] << 16)
-        | ((uint32_t)p[3] << 24);
-}
-
-static bool read_exact(HANDLE file, void *buffer, uint32_t size)
-{
-    IO_STATUS_BLOCK io = {0};
-
-    NTSTATUS status = NtReadFile(
-        file,
-        0,
-        NULL,
-        NULL,
-        &io,
-        buffer,
-        size,
-        NULL
-    );
-
-    return NT_SUCCESS(status) && io.information == size;
-}
-
-static void check_stadium_file(void)
-{
-    const char path[] = "game:\\arena\\champions_field.rlar";
-
-    ANSI_STRING name = {
-        (uint16_t)(sizeof(path) - 1),
-        (uint16_t)(sizeof(path) - 1),
-        path
-    };
-
-    OBJECT_ATTRIBUTES attributes = {
-        OB_DOS_DEVICES,
-        &name,
-        0
-    };
-
-    HANDLE file = 0;
-    IO_STATUS_BLOCK io = {0};
-
-    NTSTATUS status = NtCreateFile(
-        &file,
-        GENERIC_READ | SYNCHRONIZE,
-        &attributes,
-        &io,
-        NULL,
-        FILE_ATTRIBUTE_NORMAL,
-        FILE_SHARE_READ,
-        FILE_OPEN,
-        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT
-    );
-
-    if (!NT_SUCCESS(status)) {
-        xsdk_log_write(
-            "ARENA: erro ao abrir arquivo: 0x%08X\n",
-            (uint32_t)status
-        );
-        return;
-    }
-
-    FILE_NETWORK_OPEN_INFORMATION info = {0};
-
-    status = NtQueryInformationFile(
-        file,
-        &io,
-        &info,
-        sizeof(info),
-        FILE_NETWORK_OPEN_INFORMATION_CLASS
-    );
-
-    if (!NT_SUCCESS(status)) {
-        xsdk_log_write("ARENA: erro ao consultar tamanho: 0x%08X\n",
-                       (uint32_t)status);
-        NtClose(file);
-        return;
-    }
-
-    xsdk_log_write("ARENA: arquivo encontrado, tamanho: %llu bytes\n",
-                   (unsigned long long)info.end_of_file);
-
-    uint8_t header[12] = {0};
-
-    status = NtReadFile(
-        file,
-        0,
-        NULL,
-        NULL,
-        &io,
-        header,
-        sizeof(header),
-        NULL
-    );
-
-    NtClose(file);
-
-    if (!NT_SUCCESS(status) || io.information != sizeof(header)) {
-        xsdk_log_write("ARENA: erro ao ler cabecalho: 0x%08X\n",
-                       (uint32_t)status);
-        return;
-    }
-
-    uint32_t version = read_u32_le(&header[4]);
-    uint32_t chunks = read_u32_le(&header[8]);
-
-    if (header[0] != 'R' || header[1] != 'L' ||
-        header[2] != 'A' || header[3] != 'R') {
-        xsdk_log_write("ARENA: arquivo com magic invalido\n");
-        return;
-    }
-
-    xsdk_log_write("ARENA: versao %u, blocos %u\n",
-                   version, chunks);
-
-    if (version == 2 && chunks > 0) {
-        xsdk_log_write("ARENA: arquivo RLAR valido!\n");
-    } else {
-        xsdk_log_write("ARENA: versao ou quantidade de blocos invalida\n");
-    }
-}
-
-static void scan_stadium_file(void)
-{
-    const char path[] = "game:\\arena\\champions_field.rlar";
-
-    ANSI_STRING name = {
-        (uint16_t)(sizeof(path) - 1),
-        (uint16_t)(sizeof(path) - 1),
-        path
-    };
-
-    OBJECT_ATTRIBUTES attributes = {
-        OB_DOS_DEVICES,
-        &name,
-        0
-    };
-
-    HANDLE file = 0;
-    IO_STATUS_BLOCK io = {0};
-
-    NTSTATUS status = NtCreateFile(
-        &file,
-        GENERIC_READ | SYNCHRONIZE,
-        &attributes,
-        &io,
-        NULL,
-        FILE_ATTRIBUTE_NORMAL,
-        FILE_SHARE_READ,
-        FILE_OPEN,
-        FILE_NON_DIRECTORY_FILE |
-        FILE_SYNCHRONOUS_IO_NONALERT
-    );
-
-    if (!NT_SUCCESS(status)) {
-        xsdk_log_write("SCAN: erro ao abrir estadio");
-        return;
-    }
-
-    uint8_t header[12];
-
-    if (!read_exact(file, header, 12)) {
-        xsdk_log_write("SCAN: erro no cabecalho");
-        NtClose(file);
-        return;
-    }
-
-    if (header[0] != 'R' || header[1] != 'L' ||
-        header[2] != 'A' || header[3] != 'R' ||
-        read_u32_le(&header[4]) != 2) {
-        xsdk_log_write("SCAN: formato invalido");
-        NtClose(file);
-        return;
-    }
-
-    uint32_t chunks = read_u32_le(&header[8]);
-
-    uint8_t *vertices = malloc(60000 * 32);
-
-    if (!vertices) {
-        xsdk_log_write("SCAN: memoria insuficiente");
-        NtClose(file);
-        return;
-    }
-
-    uint8_t skip_buffer[4096];
-
-    float min_x =  1.0e30f;
-    float min_y =  1.0e30f;
-    float min_z =  1.0e30f;
-
-    float max_x = -1.0e30f;
-    float max_y = -1.0e30f;
-    float max_z = -1.0e30f;
-
-    uint32_t total_vertices = 0;
-    uint32_t total_indices = 0;
-    bool valid = true;
-
-    for (uint32_t chunk = 0; chunk < chunks; chunk++) {
-        uint8_t chunk_header[8];
-
-        if (!read_exact(file, chunk_header, 8)) {
-            valid = false;
-            break;
-        }
-
-        uint32_t vertex_count = read_u32_le(chunk_header);
-        uint32_t index_count = read_u32_le(&chunk_header[4]);
-
-        if (vertex_count == 0 || vertex_count > 60000 ||
-            index_count == 0 || index_count % 3 != 0) {
-            valid = false;
-            break;
-        }
-
-        uint32_t vertex_bytes = vertex_count * 32;
-        uint32_t index_bytes = index_count * 2;
-
-        if (!read_exact(file, vertices, vertex_bytes)) {
-            valid = false;
-            break;
-        }
-
-        for (uint32_t i = 0; i < vertex_count; i++) {
-            uint8_t *v = &vertices[i * 32];
-
-            uint32_t bx = read_u32_le(&v[0]);
-            uint32_t by = read_u32_le(&v[4]);
-            uint32_t bz = read_u32_le(&v[8]);
-
-            float x, y, z;
-
-            memcpy(&x, &bx, 4);
-            memcpy(&y, &by, 4);
-            memcpy(&z, &bz, 4);
-
-            if (x < min_x) min_x = x;
-            if (y < min_y) min_y = y;
-            if (z < min_z) min_z = z;
-
-            if (x > max_x) max_x = x;
-            if (y > max_y) max_y = y;
-            if (z > max_z) max_z = z;
-        }
-
-        uint32_t remaining = index_bytes;
-
-        while (remaining > 0) {
-            uint32_t amount = remaining;
-
-            if (amount > sizeof(skip_buffer))
-                amount = sizeof(skip_buffer);
-
-            if (!read_exact(file, skip_buffer, amount)) {
-                valid = false;
-                break;
-            }
-
-            remaining -= amount;
-        }
-
-        if (!valid)
-            break;
-
-        total_vertices += vertex_count;
-        total_indices += index_count;
-    }
-
-    if (valid) {
-        xsdk_log_write("SCAN: blocos lidos: %u", chunks);
-        xsdk_log_write("SCAN: vertices: %u", total_vertices);
-        xsdk_log_write("SCAN: indices: %u", total_indices);
-
-        xsdk_log_write(
-            "SCAN: X %d ate %d",
-            (int)(min_x * 1000.0f),
-            (int)(max_x * 1000.0f)
-        );
-
-        xsdk_log_write(
-            "SCAN: Y %d ate %d",
-            (int)(min_y * 1000.0f),
-            (int)(max_y * 1000.0f)
-        );
-
-        xsdk_log_write(
-            "SCAN: Z %d ate %d",
-            (int)(min_z * 1000.0f),
-            (int)(max_z * 1000.0f)
-        );
-
-        xsdk_log_write("SCAN: leitura concluida!");
-    } else {
-        xsdk_log_write("SCAN: erro ao percorrer os blocos");
-    }
-
-    free(vertices);
-    NtClose(file);
+    memset(renderer, 0, sizeof(*renderer));
 }
 
 int main(void)
@@ -734,9 +915,6 @@ int main(void)
 
     status = xsdk_gpu_open();
 
-             check_stadium_file();
-             scan_stadium_file();
-
     if (!NT_SUCCESS(status)) {
         xsdk_log_write("RocketLeague: GPU open failed");
         return 1;
@@ -746,8 +924,17 @@ int main(void)
 
     if (!create_renderer(&renderer)) {
         xsdk_log_write("RocketLeague: renderer creation failed");
+
+        destroy_renderer(&renderer);
         xsdk_gpu_close();
+
         return 1;
+    }
+
+    if (!load_stadium(&renderer)) {
+        xsdk_log_write(
+            "RocketLeague: estadio nao carregado; usando cubo"
+        );
     }
 
     uint32_t width = 0;
@@ -763,8 +950,10 @@ int main(void)
 
     if (!NT_SUCCESS(status)) {
         xsdk_log_write("RocketLeague: display open failed");
+
         destroy_renderer(&renderer);
         xsdk_gpu_close();
+
         return 1;
     }
 
@@ -777,6 +966,7 @@ int main(void)
     game_loop(&renderer, width, height);
 
     xsdk_present_close();
+
     destroy_renderer(&renderer);
 
     status = xsdk_gpu_close();
