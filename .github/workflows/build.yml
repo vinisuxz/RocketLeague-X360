@@ -46,6 +46,9 @@ jobs:
             assets/arena/champions_field.glb \
             --out build/arena/champions_field.rlar
 
+            ls -lh build/arena/champions_field.rlar
+            stat -c "TAMANHO EM BYTES: %s" build/arena/champions_field.rlar
+
       - name: Build XSDK toolchain
         run: |
           PREFIX="$GITHUB_WORKSPACE/xsdk-gcc"
