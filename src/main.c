@@ -418,6 +418,113 @@ static void destroy_renderer(Renderer *renderer)
     xsdk_shader_free(&renderer->vertex);
 }
 
+static uint32_t read_u32_le(const uint8_t *p)
+{
+    return (uint32_t)p[0]
+        | ((uint32_t)p[1] << 8)
+        | ((uint32_t)p[2] << 16)
+        | ((uint32_t)p[3] << 24);
+}
+
+static void check_stadium_file(void)
+{
+    const char path[] = "game:\\arena\\champions_field.rlar";
+
+    ANSI_STRING name = {
+        (uint16_t)(sizeof(path) - 1),
+        (uint16_t)(sizeof(path) - 1),
+        path
+    };
+
+    OBJECT_ATTRIBUTES attributes = {
+        OB_DOS_DEVICES,
+        &name,
+        0
+    };
+
+    HANDLE file = 0;
+    IO_STATUS_BLOCK io = {0};
+
+    NTSTATUS status = NtCreateFile(
+        &file,
+        GENERIC_READ | SYNCHRONIZE,
+        &attributes,
+        &io,
+        NULL,
+        FILE_ATTRIBUTE_NORMAL,
+        FILE_SHARE_READ,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT
+    );
+
+    if (!NT_SUCCESS(status)) {
+        xsdk_log_write(
+            "ARENA: erro ao abrir arquivo: 0x%08X\n",
+            (uint32_t)status
+        );
+        return;
+    }
+
+    FILE_NETWORK_OPEN_INFORMATION info = {0};
+
+    status = NtQueryInformationFile(
+        file,
+        &io,
+        &info,
+        sizeof(info),
+        FILE_NETWORK_OPEN_INFORMATION_CLASS
+    );
+
+    if (!NT_SUCCESS(status)) {
+        xsdk_log_write("ARENA: erro ao consultar tamanho: 0x%08X\n",
+                       (uint32_t)status);
+        NtClose(file);
+        return;
+    }
+
+    xsdk_log_write("ARENA: arquivo encontrado, tamanho: %llu bytes\n",
+                   (unsigned long long)info.end_of_file);
+
+    uint8_t header[12] = {0};
+
+    status = NtReadFile(
+        file,
+        0,
+        NULL,
+        NULL,
+        &io,
+        header,
+        sizeof(header),
+        NULL
+    );
+
+    NtClose(file);
+
+    if (!NT_SUCCESS(status) || io.information != sizeof(header)) {
+        xsdk_log_write("ARENA: erro ao ler cabecalho: 0x%08X\n",
+                       (uint32_t)status);
+        return;
+    }
+
+    uint32_t version = read_u32_le(&header[4]);
+    uint32_t chunks = read_u32_le(&header[8]);
+
+    if (header[0] != 'R' || header[1] != 'L' ||
+        header[2] != 'A' || header[3] != 'R') {
+        xsdk_log_write("ARENA: arquivo com magic invalido\n");
+        return;
+    }
+
+    xsdk_log_write("ARENA: versao %u, blocos %u\n",
+                   version, chunks);
+
+    if (version == 2 && chunks > 0) {
+        xsdk_log_write("ARENA: arquivo RLAR valido!\n");
+    } else {
+        xsdk_log_write("ARENA: versao ou quantidade de blocos invalida\n");
+    }
+}
+
 int main(void)
 {
     xsdk_log_write("RocketLeague: START");
