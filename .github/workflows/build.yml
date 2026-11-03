@@ -1,0 +1,137 @@
+name: Build RocketLeague X360
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    env:
+      BUILD_JOBS: 4
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \\
+            build-essential bison flex texinfo \\
+            libgmp-dev libmpfr-dev libmpc-dev \\
+            curl xz-utils patch python3 \\
+            cmake ninja-build git ccache
+
+      - name: Checkout XSDK
+        uses: actions/checkout@v4
+        with:
+          repository: xenosworks/xsdk
+          path: xsdk
+
+      - name: Cache XSDK toolchain
+        id: cache-xsdk
+        uses: actions/cache@v4
+        with:
+          path: xsdk-gcc
+          key: ${{ runner.os }}-xsdk-toolchain-${{ hashFiles('xsdk/tools/toolchain/**') }}
+
+      - name: Download Champions Field
+        run: |
+          mkdir -p assets/arena build/arena
+          curl -fL "https://github.com/vinisuxz/RocketLeague-X360/releases/download/v1.0/champions_field_-_rocket_league_stadium.glb" \\
+            -o assets/arena/champions_field.glb
+          test -s assets/arena/champions_field.glb
+
+      - name: Install converter dependencies
+        run: |
+          python3 -m pip install --break-system-packages numpy trimesh
+
+      - name: Convert Champions Field
+        run: |
+          python3 tools/convert_glb.py \\
+            assets/arena/champions_field.glb \\
+            --out build/arena/champions_field.rlar
+          ls -lh build/arena/champions_field.rlar
+          stat -c "TAMANHO EM BYTES: %s" build/arena/champions_field.rlar
+
+      - name: Build XSDK toolchain
+        if: steps.cache-xsdk.outputs.cache-hit != 'true'
+        run: |
+          PREFIX="$GITHUB_WORKSPACE/xsdk-gcc"
+          WORK="$RUNNER_TEMP/xsdk-gcc-work"
+          cd xsdk
+          PREFIX="$PREFIX" \\
+          WORK="$WORK" \\
+          JOBS="$BUILD_JOBS" \\
+          bash tools/toolchain/build.sh
+
+      - name: Checkout glslang-xenon
+        uses: actions/checkout@v4
+        with:
+          repository: xenosworks/glslang-xenon
+          ref: xenon
+          path: glslang-xenon
+
+      - name: Cache glslang build
+        uses: actions/cache@v4
+        with:
+          path: glslang-xenon/build
+          key: ${{ runner.os }}-glslang-xenon-${{ hashFiles('glslang-xenon/**') }}
+
+      - name: Build glslang
+        run: |
+          cd glslang-xenon
+          python3 update_glslang_sources.py
+          cmake -S . -B build -G Ninja \\
+            -DCMAKE_BUILD_TYPE=Release \\
+            -DENABLE_OPT=ON \\
+            -DSPIRV_SKIP_EXECUTABLES=ON \\
+            -DGLSLANG_TESTS=OFF
+          cmake --build build --parallel "$BUILD_JOBS"
+
+      - name: Install glslang
+        run: |
+          cp glslang-xenon/build/StandAlone/glslang \\
+            xsdk-gcc/bin/glslang
+          xsdk-gcc/bin/glslang --version
+
+      - name: Build XSDK library
+        run: |
+          make -C xsdk -j"$BUILD_JOBS" \\
+            TOOLCHAIN="$GITHUB_WORKSPACE/xsdk-gcc/bin/powerpc-xsdk-elf-"
+
+      - name: Cache C/C++ compilation
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ${{ runner.os }}-rocket-x-ccache-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-rocket-x-ccache-${{ github.ref_name }}-
+            ${{ runner.os }}-rocket-x-ccache-
+
+      - name: Configure RocketLeague
+        run: |
+          cmake -S . -B build -G Ninja \\
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/xsdk/cmake/xsdk.cmake" \\
+            -DXSDK_TOOLCHAIN="$GITHUB_WORKSPACE/xsdk-gcc" \\
+            -DCMAKE_BUILD_TYPE=Release \\
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \\
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Compile RocketLeague
+        run: |
+          cmake --build build --parallel "$BUILD_JOBS"
+          ccache --show-stats
+
+      - name: Upload XEX and Stadium
+        uses: actions/upload-artifact@v4
+        with:
+          name: RocketLeague-X360
+          path: |
+            build/RocketLeague.xex
+            build/arena/champions_field.rlar
